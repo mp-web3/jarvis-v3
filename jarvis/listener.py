@@ -104,9 +104,12 @@ class JarvisListener:
         self._accumulated_text = ""
         self._is_accumulating = False
 
+        # Polish (LLM transcript cleanup)
+        listener_cfg = self.config.get("listener", {})
+        self._polish_enabled = listener_cfg.get("polish_enabled", False)
+
         # Barge-in
         self._response_cancel_event: asyncio.Event | None = None
-        listener_cfg = self.config.get("listener", {})
         self._bargein_enabled = listener_cfg.get("bargein_enabled", True)
         chunk_ms = listener_cfg.get("chunk_ms", 30)
         bargein_ms = listener_cfg.get("bargein_sustain_ms", 800)
@@ -267,7 +270,17 @@ class JarvisListener:
 
         raw_text = self._accumulated_text.strip()
         self._accumulated_text = ""
-        text = _clean_transcript(raw_text)
+
+        # Polish with LLM or fall back to regex cleanup
+        if self._polish_enabled:
+            from jarvis.polisher import polish
+
+            async with self.resources.mlx_lock:
+                text = await asyncio.get_running_loop().run_in_executor(
+                    None, polish, raw_text
+                )
+        else:
+            text = _clean_transcript(raw_text)
 
         if raw_text != text:
             logger.debug("Cleaned: '%s' → '%s'", raw_text, text)

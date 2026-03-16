@@ -28,6 +28,8 @@ pvad:
 listener:
   input_device: "MacBook Air Microphone"
   output_device: "AirPods"
+  polish_enabled: true
+  polish_model: "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
   chunk_ms: 30
   ring_buffer_ms: 800
   silence_ms: 700
