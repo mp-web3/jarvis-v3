@@ -12,6 +12,7 @@ Key improvements over v2:
 
 import asyncio
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,26 @@ TTS_QUEUE = Path.home() / ".claude" / ".tts-queue"
 SPEAKER_EMBEDDING = Path(__file__).parent.parent / "speaker_embedding_ecapa.npy"
 
 EXIT_PHRASES = {"stop jarvis", "jarvis stop", "esci jarvis"}
+
+# Filler words to strip from transcriptions (en + it)
+_FILLERS = re.compile(
+    r"\b(uh|uhm|um|umm|ah|eh|er|erm|hmm|hm|like|you know|i mean|basically|actually"
+    r"|allora|cioè|ehm|beh|mah|diciamo|praticamente)\b",
+    re.IGNORECASE,
+)
+
+
+def _clean_transcript(text: str) -> str:
+    """Remove filler words and deduplicate consecutive repeated words."""
+    # Strip fillers
+    text = _FILLERS.sub("", text)
+    # Deduplicate consecutive repeated words: "the the" → "the"
+    text = re.sub(r"\b(\w+)(\s+\1)+\b", r"\1", text, flags=re.IGNORECASE)
+    # Collapse whitespace
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    # Fix orphaned punctuation from filler removal
+    text = re.sub(r"\s+([.,!?])", r"\1", text)
+    return text
 
 
 def _find_device(name: str, direction: str = "input") -> int | None:
@@ -244,8 +265,12 @@ class JarvisListener:
         if not self._accumulated_text:
             return
 
-        text = self._accumulated_text.strip()
+        raw_text = self._accumulated_text.strip()
         self._accumulated_text = ""
+        text = _clean_transcript(raw_text)
+
+        if raw_text != text:
+            logger.debug("Cleaned: '%s' → '%s'", raw_text, text)
 
         lower = text.lower().rstrip(".!?,")
         if lower in EXIT_PHRASES:
