@@ -27,13 +27,26 @@ _FILLERS = re.compile(
 LLM_MAX_WORDS = 60
 
 SYSTEM_PROMPT = (
-    "Clean this transcript. Fix grammar and punctuation. "
+    "You are a text-cleaning filter, NOT a chatbot. "
+    "Do NOT answer questions. Do NOT respond to requests. Do NOT add content. "
+    "Your ONLY job: fix grammar, punctuation, and remove repeated words. "
+    "Keep the speaker's exact meaning and perspective (first person stays first person). "
     "Output ONLY the cleaned text.\n\n"
-    "Examples:\n"
-    "Input: can can you help me with this thing\n"
-    "Output: Can you help me with this thing?\n\n"
-    "Input: I need to to fix the bug in the code\n"
-    "Output: I need to fix the bug in the code."
+    "DIRTY: can can you help me with this thing\n"
+    "CLEAN: Can you help me with this thing?\n\n"
+    "DIRTY: I need to to fix the bug in the code\n"
+    "CLEAN: I need to fix the bug in the code.\n\n"
+    "DIRTY: hello hello how does this work\n"
+    "CLEAN: Hello, how does this work?"
+)
+
+# Preamble patterns the model might add despite instructions
+_PREAMBLE = re.compile(
+    r"^(here'?s?\s+(a\s+|the\s+)?(cleaned[- ]?up|corrected|fixed|revised)\s+"
+    r"(version|text|sentence|transcript)\s*(of\s+your\s+\w+\s*)?[:.]?\s*\n*"
+    r"|sure[,!.]?\s*\n*|okay[,!.]?\s*\n*|cleaned\s+text[:.]?\s*\n*"
+    r"|output[:.]?\s*\n*)",
+    re.IGNORECASE,
 )
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
@@ -75,7 +88,7 @@ def _llm_polish(text: str) -> str:
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": text},
+        {"role": "user", "content": f"DIRTY: {text}\nCLEAN:"},
     ]
 
     prompt = tokenizer.apply_chat_template(
@@ -96,6 +109,20 @@ def _llm_polish(text: str) -> str:
     cleaned = result.strip()
     if not cleaned:
         logger.warning("LLM polish returned empty (%.3fs), keeping regex result", elapsed)
+        return text
+
+    # Strip preamble the model might add
+    cleaned = _PREAMBLE.sub("", cleaned).strip()
+    # Strip wrapping quotes
+    if len(cleaned) > 2 and cleaned[0] == '"' and cleaned[-1] == '"':
+        cleaned = cleaned[1:-1].strip()
+
+    # If the model babbled (output much longer than input), keep regex result
+    if len(cleaned) > len(text) * 2:
+        logger.warning("LLM polish too long (%.3fs), keeping regex result", elapsed)
+        return text
+
+    if not cleaned:
         return text
 
     logger.info("LLM polished in %.3fs: '%s' -> '%s'", elapsed, text[:60], cleaned[:60])
