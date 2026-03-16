@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-from jarvis.config import CHUNK_SIZE, SAMPLE_RATE, get_config
+from jarvis.config import CHUNK_SIZE, MIN_SEGMENT_DURATION, SAMPLE_RATE, get_config
 from jarvis.pipeline import PipelineEvent, PipelineResources, SpeechDetector
 
 logger = logging.getLogger(__name__)
@@ -212,8 +212,7 @@ class JarvisListener:
                 self._transcription_queue.task_done()
 
     async def _finalize_and_send(self):
-        if self._transcription_queue.qsize() > 0:
-            await self._transcription_queue.join()
+        await self._transcription_queue.join()
 
         self._is_accumulating = False
         if not self._accumulated_text:
