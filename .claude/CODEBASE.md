@@ -1,45 +1,47 @@
 <!-- docs-synced-at: initial -->
 # Jarvis v3 — Codebase Overview
 
-Local voice interface for Claude Code on Apple Silicon. Parakeet TDT for speech-to-text, Kokoro via mlx-audio for text-to-speech, FireRedChat pVAD for speaker-verified voice activity detection. Runs entirely on-device — no cloud APIs for audio.
+Local voice interface for Claude Code on Apple Silicon. Parakeet TDT (STT) + Kokoro (TTS) + dual VAD (Silero generic + FireRedChat personalized) + SmartTurn EOU detection. Adapted from jarvis-v2 + shubhdotai/offline-voice-ai patterns.
 
 ## Architecture
 
 ```
-Mic -> pVAD (voice activity) -> Parakeet TDT (STT) -> tmux send-keys -> Claude Code
-                                                                           |
-Speaker <- sounddevice <- Kokoro mlx-audio (TTS) <- Claude hook (voice-output-hook)
+Mic -> Silero VAD (4-state machine) -> EOU detection -> Parakeet TDT (STT)
+  -> tmux send-keys -> Claude Code
+                          |
+Speaker <- sounddevice <- Kokoro TTS <- voice-output-hook (.tts-queue file)
 ```
 
-Web mode (phone):
-```
-Phone mic -> MediaRecorder -> WebSocket -> ffmpeg decode -> Parakeet STT
-  -> claude -p (full context) -> Kokoro TTS -> WAV -> WebSocket -> Audio element
-```
+Key design: asyncio.Lock guards all MLX ops (STT + TTS never concurrent).
+Barge-in uses asyncio.Event for clean cancellation of TTS playback.
 
 ## Tech Stack
-- Python 3.12+, uv package manager, hatchling build
-- parakeet-mlx (STT) — transducer architecture, outputs blanks on silence
-- mlx-audio (TTS) — Kokoro 82M, pure MLX, no PyTorch GPU contention
-- onnxruntime (pVAD) — FireRedChat pvad.onnx on CPU
+- Python 3.12+, uv, hatchling
+- parakeet-mlx (STT) — transducer, no hallucinations
+- mlx-audio (TTS) — Kokoro 82M, pure MLX
+- onnxruntime — Silero VAD + pVAD + SmartTurn EOU (all CPU, no GPU contention)
+- transformers — WhisperFeatureExtractor for EOU model
 - sounddevice + soundfile — audio I/O
-- scipy — resampling (24kHz Kokoro -> 48kHz AirPods)
-- FastAPI + uvicorn — web/phone interface
-- spacy — (v2 dep, evaluate if still needed)
+- scipy — resampling (24kHz -> device native rate)
+- FastAPI + uvicorn — web/phone interface (optional)
 
 ## Modules
 
 | Module | Description | Docs |
 |--------|-------------|------|
 | `jarvis/cli.py` | CLI entry point (start, test, say, status) | — |
-| `jarvis/listener.py` | Main async loop: mic -> VAD -> STT -> tmux, barge-in, AEC | [docs/listener.md](docs/listener.md) |
-| `jarvis/transcriber.py` | Parakeet TDT wrapper, model caching | [docs/audio.md](docs/audio.md) |
+| `jarvis/config.py` | Configuration constants + YAML loader | — |
+| `jarvis/pipeline.py` | PipelineResources, SpeechDetector (4-state VAD machine) | [docs/listener.md](docs/listener.md) |
+| `jarvis/listener.py` | tmux-mode listener using pipeline components | [docs/listener.md](docs/listener.md) |
+| `jarvis/vad.py` | SileroVAD, PersonalizedVAD, EndOfUtteranceDetector | [docs/pvad.md](docs/pvad.md) |
+| `jarvis/audio_buffer.py` | Pre-buffer + active segment capture | [docs/listener.md](docs/listener.md) |
+| `jarvis/transcriber.py` | Parakeet TDT wrapper | [docs/audio.md](docs/audio.md) |
 | `jarvis/speaker.py` | Kokoro TTS wrapper, resampling, bilingual | [docs/audio.md](docs/audio.md) |
-| `jarvis/pvad.py` | Personalized VAD (ONNX), speaker embedding | [docs/pvad.md](docs/pvad.md) |
-| `web/server.py` | FastAPI WebSocket server for phone | [docs/web.md](docs/web.md) |
-| `web/index.html` | Push-to-talk mobile UI | [docs/web.md](docs/web.md) |
 
 ## Key Files
-- `config.yaml` — all tunable parameters (devices, thresholds, models, voices)
-- `models/pvad/pvad.onnx` — pVAD model (not in git, download from HuggingFace)
-- `speaker_embedding_ecapa.npy` — speaker enrollment (not in git, user-specific)
+- `config.yaml` — tunable parameters (devices, thresholds, models, voices)
+- `models/silero_vad.onnx` — Silero VAD (not in git)
+- `models/smart_turn_v3.onnx` — SmartTurn EOU detector (not in git)
+- `models/pvad/pvad.onnx` — pVAD model (not in git)
+- `speaker_embedding_ecapa.npy` — speaker enrollment (not in git)
+- `reference/` — source repos used for adaptation (offline-voice-ai, pipecat-macos)

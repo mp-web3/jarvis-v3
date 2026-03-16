@@ -1,0 +1,23 @@
+[project]
+name = "macos-local-voice-agents-server"
+version = "0.1.0"
+description = "Local voice agents server for macOS"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pip",
+    "python-dotenv",
+    "fastapi[all]",
+    "uvicorn",
+    "opencv-python",
+    "mlx-lm",
+    "mlx-audio",
+    "pipecat-ai[openai,deepgram,rime,silero,mlx-whisper]>=0.0.81",
+    "pipecat-ai-small-webrtc-prebuilt",
+    "aiortc",
+    "nltk",
+    "pyobjc-core",
+    "pyobjc-framework-Quartz",
+    "pyobjc-framework-Cocoa",
+    "pyobjc-framework-ApplicationServices",
+]
