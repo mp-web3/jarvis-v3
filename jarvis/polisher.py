@@ -2,8 +2,7 @@
 
 Two stages:
 1. Regex: strip fillers, deduplicate words, fix whitespace (fast, reliable)
-2. LLM: grammar and restructuring via small MLX model (only for short/medium inputs
-   where 0.5B models are effective — under ~20 words after regex cleanup)
+2. LLM: grammar and restructuring via Qwen 1.5B MLX model
 
 Singleton model with explicit preload for Metal GPU safety.
 """
@@ -24,8 +23,8 @@ _FILLERS = re.compile(
     re.IGNORECASE,
 )
 
-# Max word count for LLM polish (0.5B models degrade on longer inputs)
-LLM_MAX_WORDS = 25
+# Max word count for LLM polish (beyond this, regex-only)
+LLM_MAX_WORDS = 60
 
 SYSTEM_PROMPT = (
     "Clean this transcript. Fix grammar and punctuation. "
@@ -37,7 +36,7 @@ SYSTEM_PROMPT = (
     "Output: I need to fix the bug in the code."
 )
 
-DEFAULT_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+DEFAULT_MODEL = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 
 
 def _get_model(model_name: str | None = None):
@@ -70,21 +69,8 @@ def _regex_clean(text: str) -> str:
     return text
 
 
-def _word_overlap(a: str, b: str) -> float:
-    """Fraction of words in b that also appear in a (case-insensitive)."""
-    words_a = set(a.lower().split())
-    words_b = b.lower().split()
-    if not words_b:
-        return 0.0
-    return sum(1 for w in words_b if w in words_a) / len(words_b)
-
-
 def _llm_polish(text: str) -> str:
-    """Stage 2: LLM grammar polish for short/medium inputs.
-
-    Includes a divergence guard: if the LLM output shares less than 50%
-    of words with the input, it likely hallucinated — fall back to regex.
-    """
+    """Stage 2: LLM grammar polish."""
     model, tokenizer = _get_model()
 
     messages = [
@@ -112,21 +98,12 @@ def _llm_polish(text: str) -> str:
         logger.warning("LLM polish returned empty (%.3fs), keeping regex result", elapsed)
         return text
 
-    # Guard: reject if LLM output diverged too much (hallucination)
-    overlap = _word_overlap(text, cleaned)
-    if overlap < 0.5:
-        logger.warning(
-            "LLM polish diverged (overlap %.0f%%), keeping regex: '%s' -> '%s'",
-            overlap * 100, text[:60], cleaned[:60],
-        )
-        return text
-
     logger.info("LLM polished in %.3fs: '%s' -> '%s'", elapsed, text[:60], cleaned[:60])
     return cleaned
 
 
 def polish(text: str) -> str:
-    """Clean up a transcript. Regex first, then LLM for short inputs."""
+    """Clean up a transcript. Regex first, then LLM."""
     if not text or not text.strip():
         return text
 
@@ -136,7 +113,7 @@ def polish(text: str) -> str:
     if not cleaned:
         return text
 
-    # Stage 2: LLM (only for short/medium inputs where 0.5B is effective)
+    # Stage 2: LLM
     word_count = len(cleaned.split())
     if word_count <= LLM_MAX_WORDS:
         try:

@@ -59,7 +59,7 @@ TTS_SPEED = 1.0
 TTS_SAMPLE_RATE = 24000
 
 # Polish (transcript cleanup LLM)
-POLISH_MODEL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+POLISH_MODEL = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 
 # LLM sentence streaming
 LLM_SENTENCE_DELIMITERS = ".!?"
