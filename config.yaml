@@ -1,0 +1,43 @@
+audio:
+  sample_rate: 16000
+  channels: 1
+
+stt:
+  model: "mlx-community/parakeet-tdt-0.6b-v3"
+
+tts:
+  model: "mlx-community/Kokoro-82M-bf16"
+  voice: "af_heart"
+  lang_code: "a"
+  speed: 1.0
+  sample_rate: 24000
+  voices:
+    en:
+      voice: "af_heart"
+      lang_code: "a"
+    it:
+      voice: "if_sara"
+      lang_code: "i"
+
+pvad:
+  activation_threshold: 0.85
+  model_dir: "models/pvad"
+  min_speech_frames: 10
+  min_silence_frames: 20
+
+listener:
+  input_device: "MacBook Air Microphone"
+  output_device: "AirPods"
+  chunk_ms: 30
+  ring_buffer_ms: 800
+  silence_ms: 700
+  min_speech_s: 0.4
+  debounce_ms: 300
+  bargein_enabled: true
+  bargein_sustain_ms: 800
+  min_utterance_energy: 0.0005
+  loopback_device: "BlackHole 2ch"
+  aec_delay_ms: 10
+
+jarvis:
+  tmux_target: "claude:0"

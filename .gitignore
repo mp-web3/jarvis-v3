@@ -1,0 +1,8 @@
+.venv/
+models/
+*.log
+__pycache__/
+*.npy
+*.egg-info/
+web/cert.pem
+web/key.pem
