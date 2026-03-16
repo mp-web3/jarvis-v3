@@ -21,8 +21,9 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-from jarvis.config import CHUNK_SIZE, MIN_SEGMENT_DURATION, SAMPLE_RATE, get_config
+from jarvis.config import CHUNK_SIZE, MIN_SEGMENT_DURATION, SAMPLE_RATE, VAD_START_THRESHOLD, get_config
 from jarvis.pipeline import PipelineEvent, PipelineResources, SpeechDetector
+from jarvis.vad import SileroVAD
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ class JarvisListener:
 
         self._running = False
         self._tts_playing = False
+        self._tts_settling = False
 
         # Transcription
         self._transcription_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
@@ -83,9 +85,15 @@ class JarvisListener:
 
         # Barge-in
         self._response_cancel_event: asyncio.Event | None = None
+        listener_cfg = self.config.get("listener", {})
+        self._bargein_enabled = listener_cfg.get("bargein_enabled", True)
+        chunk_ms = listener_cfg.get("chunk_ms", 30)
+        bargein_ms = listener_cfg.get("bargein_sustain_ms", 800)
+        self._bargein_threshold = max(1, int(bargein_ms / chunk_ms))
+        self._bargein_count = 0
+        self._bargein_vad = SileroVAD()  # separate VAD instance for barge-in
 
         # Debounce for tmux (combine rapid utterances)
-        listener_cfg = self.config.get("listener", {})
         debounce_ms = listener_cfg.get("debounce_ms", 300)
         self._debounce_s = debounce_ms / 1000.0
         self._text_buffer: list[str] = []
@@ -146,7 +154,25 @@ class JarvisListener:
                 except asyncio.TimeoutError:
                     continue
 
+                # Settling after barge-in: discard mic input while sd.stop() completes
+                if self._tts_settling:
+                    continue
+
+                # During TTS: run VAD for barge-in detection
                 if self._tts_playing:
+                    if self._bargein_enabled and self._response_cancel_event:
+                        vad_prob = self._bargein_vad.process_chunk(chunk)
+                        if vad_prob >= VAD_START_THRESHOLD:
+                            self._bargein_count += 1
+                            if self._bargein_count >= self._bargein_threshold:
+                                logger.info(
+                                    "Barge-in: speech detected for %d chunks (vad: %.3f)",
+                                    self._bargein_count, vad_prob,
+                                )
+                                self._response_cancel_event.set()
+                                self._bargein_count = 0
+                        else:
+                            self._bargein_count = 0
                     continue
 
                 events = self.detector.process_chunk(chunk)
@@ -279,8 +305,12 @@ class JarvisListener:
 
             if self._response_cancel_event.is_set():
                 sd.stop()
-                await asyncio.sleep(0.1)
-                logger.info("TTS interrupted")
+                self._tts_settling = True
+                await asyncio.sleep(0.15)
+                self._tts_settling = False
+                self._bargein_vad.reset()
+                self.detector.vad.reset()
+                logger.info("TTS interrupted, settled")
             else:
                 logger.info("TTS finished")
 
@@ -288,6 +318,8 @@ class JarvisListener:
             logger.exception("TTS failed")
         finally:
             self._tts_playing = False
+            self._tts_settling = False
+            self._bargein_count = 0
             self._response_cancel_event = None
             SPEAKING_FLAG.unlink(missing_ok=True)
 
