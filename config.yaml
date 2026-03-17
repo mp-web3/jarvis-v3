@@ -36,6 +36,7 @@ listener:
   min_speech_s: 0.4
   debounce_ms: 300
   bargein_enabled: true
+  bargein_smart: true
   bargein_sustain_ms: 800
   min_utterance_energy: 0.0005
   loopback_device: "BlackHole 2ch"

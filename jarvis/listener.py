@@ -42,6 +42,15 @@ _FILLERS = re.compile(
     re.IGNORECASE,
 )
 
+# Filler-only patterns for barge-in classification (en + it)
+# These are utterances that should NOT interrupt TTS
+_BARGEIN_FILLER = re.compile(
+    r"^(uh|uhm|um|umm|ah|eh|er|erm|hmm|hm|mm|mhm|uh huh|oh|okay|ok|right|yeah"
+    r"|yes|no|sure|huh|wow|whoa|ooh|aah"
+    r"|sì|no|ok|va bene|ah|eh|oh|mah|beh|ehm|allora)\.?$",
+    re.IGNORECASE,
+)
+
 
 def _clean_transcript(text: str) -> str:
     """Remove filler words and deduplicate consecutive repeated words."""
@@ -111,11 +120,14 @@ class JarvisListener:
         # Barge-in
         self._response_cancel_event: asyncio.Event | None = None
         self._bargein_enabled = listener_cfg.get("bargein_enabled", True)
+        self._bargein_smart = listener_cfg.get("bargein_smart", True)
         chunk_ms = listener_cfg.get("chunk_ms", 30)
         bargein_ms = listener_cfg.get("bargein_sustain_ms", 800)
         self._bargein_threshold = max(1, int(bargein_ms / chunk_ms))
         self._bargein_count = 0
         self._bargein_vad = SileroVAD()  # separate VAD instance for barge-in
+        self._bargein_buffer: list[np.ndarray] = []  # audio buffer for smart barge-in
+        self._bargein_classifying = False  # prevent re-entry during classification
 
         # Debounce for tmux (combine rapid utterances)
         debounce_ms = listener_cfg.get("debounce_ms", 300)
@@ -184,19 +196,27 @@ class JarvisListener:
 
                 # During TTS: run VAD for barge-in detection
                 if self._tts_playing:
-                    if self._bargein_enabled and self._response_cancel_event:
+                    if self._bargein_enabled and self._response_cancel_event and not self._bargein_classifying:
                         vad_prob = self._bargein_vad.process_chunk(chunk)
+                        self._bargein_buffer.append(chunk)
                         if vad_prob >= VAD_START_THRESHOLD:
                             self._bargein_count += 1
                             if self._bargein_count >= self._bargein_threshold:
-                                logger.info(
-                                    "Barge-in: speech detected for %d chunks (vad: %.3f)",
-                                    self._bargein_count, vad_prob,
-                                )
-                                self._response_cancel_event.set()
+                                if self._bargein_smart:
+                                    await self._classify_bargein()
+                                else:
+                                    logger.info(
+                                        "Barge-in: speech detected for %d chunks",
+                                        self._bargein_count,
+                                    )
+                                    self._response_cancel_event.set()
                                 self._bargein_count = 0
                         else:
                             self._bargein_count = 0
+                        # Keep buffer trimmed when no barge-in triggered
+                        max_buf = self._bargein_threshold * 3
+                        if len(self._bargein_buffer) > max_buf:
+                            self._bargein_buffer = self._bargein_buffer[-max_buf:]
                     continue
 
                 events = self.detector.process_chunk(chunk)
@@ -300,6 +320,47 @@ class JarvisListener:
             None, _send_to_tmux, text, self.tmux_target
         )
 
+    async def _classify_bargein(self):
+        """Smart barge-in: transcribe the interruption to classify filler vs intentional."""
+        from jarvis.transcriber import transcribe
+
+        self._bargein_classifying = True
+        try:
+            audio = np.concatenate(self._bargein_buffer)
+            self._bargein_buffer.clear()
+
+            # Quick transcription of the barge-in segment
+            async with self.resources.mlx_lock:
+                text = await asyncio.get_running_loop().run_in_executor(
+                    None, transcribe, audio, SAMPLE_RATE
+                )
+
+            if not text or not text.strip():
+                logger.info("Barge-in: no speech detected, resuming TTS")
+                return
+
+            clean = text.strip()
+            lower = clean.lower().rstrip(".!?,")
+
+            # Check if it's filler
+            if _BARGEIN_FILLER.match(lower):
+                logger.info("Barge-in: filler ('%s'), resuming TTS", clean)
+                return
+
+            # Intentional interruption — cancel TTS
+            logger.info("Barge-in: intentional ('%s'), cancelling TTS", clean)
+            self._response_cancel_event.set()
+
+            # Feed transcribed text into accumulator for processing
+            self._accumulated_text = clean
+            self._is_accumulating = True
+
+        except Exception:
+            logger.exception("Barge-in classification failed, cancelling TTS")
+            self._response_cancel_event.set()
+        finally:
+            self._bargein_classifying = False
+
     async def _watch_tts_queue(self):
         """Poll for TTS text queued by voice output hook."""
         from jarvis.speaker import get_sample_rate, render
@@ -358,6 +419,8 @@ class JarvisListener:
             self._tts_playing = False
             self._tts_settling = False
             self._bargein_count = 0
+            self._bargein_buffer.clear()
+            self._bargein_classifying = False
             self._response_cancel_event = None
             SPEAKING_FLAG.unlink(missing_ok=True)
 
