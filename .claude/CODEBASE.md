@@ -6,10 +6,17 @@ Local voice interface for Claude Code on Apple Silicon. Parakeet TDT (STT) + Kok
 ## Architecture
 
 ```
-Mic -> Silero VAD (4-state machine) -> EOU detection -> Parakeet TDT (STT)
-  -> tmux send-keys -> Claude Code
-                          |
-Speaker <- sounddevice <- Kokoro TTS <- voice-output-hook (.tts-queue file)
+tmux mode (jarvis start):
+  Mic -> Silero VAD (4-state machine) -> EOU detection -> Parakeet TDT (STT)
+    -> tmux send-keys -> Claude Code
+                            |
+  Speaker <- sounddevice <- Kokoro TTS <- voice-output-hook (.tts-queue file)
+
+web mode (jarvis web):
+  Browser mic (AEC on) -> WebSocket -> Silero VAD -> EOU -> Parakeet STT
+    -> tmux send-keys -> Claude Code
+                            |
+  Browser speaker <- WebSocket <- WAV <- Kokoro TTS <- voice-output-hook (.tts-queue)
 ```
 
 Key design: asyncio.Lock guards all MLX ops (STT + TTS never concurrent).
@@ -29,7 +36,7 @@ Barge-in uses asyncio.Event for clean cancellation of TTS playback.
 
 | Module | Description | Docs |
 |--------|-------------|------|
-| `jarvis/cli.py` | CLI entry point (start, test, say, status) | — |
+| `jarvis/cli.py` | CLI entry point (start, test, say, web, status) | — |
 | `jarvis/config.py` | Configuration constants + YAML loader | — |
 | `jarvis/pipeline.py` | PipelineResources, SpeechDetector (4-state VAD machine) | [docs/listener.md](docs/listener.md) |
 | `jarvis/listener.py` | tmux-mode listener using pipeline components | [docs/listener.md](docs/listener.md) |
@@ -37,6 +44,7 @@ Barge-in uses asyncio.Event for clean cancellation of TTS playback.
 | `jarvis/audio_buffer.py` | Pre-buffer + active segment capture | [docs/listener.md](docs/listener.md) |
 | `jarvis/transcriber.py` | Parakeet TDT wrapper | [docs/audio.md](docs/audio.md) |
 | `jarvis/speaker.py` | Kokoro TTS wrapper, resampling, bilingual | [docs/audio.md](docs/audio.md) |
+| `jarvis/web/server.py` | Web mode: FastAPI + WebSocket server, browser AEC | [docs/web-mode-spec.md](docs/web-mode-spec.md) |
 
 ## Key Files
 - `config.yaml` — tunable parameters (devices, thresholds, models, voices)
@@ -44,4 +52,6 @@ Barge-in uses asyncio.Event for clean cancellation of TTS playback.
 - `models/smart_turn_v3.onnx` — SmartTurn EOU detector (not in git)
 - `models/pvad/pvad.onnx` — pVAD model (not in git)
 - `speaker_embedding_ecapa.npy` — speaker enrollment (not in git)
+- `web/index.html` — browser client (AEC, correlator, playback queue, barge-in)
+- `web/correlator.js` — AudioWorklet for echo detection (cosine similarity)
 - `reference/` — source repos used for adaptation (offline-voice-ai, pipecat-macos)

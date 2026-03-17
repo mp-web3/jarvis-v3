@@ -44,6 +44,18 @@ def cmd_say(args):
         speak(text.strip(), lang=args.lang)
 
 
+def cmd_web(args):
+    """Start Jarvis web server (browser-based voice I/O with AEC)."""
+    from jarvis.config import get_config
+    from jarvis.web.server import run_web
+
+    config = get_config()
+    target = args.target or config.get("jarvis", {}).get("tmux_target", "claude:0")
+    host = args.host or config.get("web", {}).get("host", "0.0.0.0")
+    port = args.port or config.get("web", {}).get("port", 8000)
+    run_web(tmux_target=target, host=host, port=port)
+
+
 def cmd_status(args):
     """Show Jarvis v3 status."""
     from pathlib import Path
@@ -82,6 +94,11 @@ def main():
     say_p.add_argument("text", nargs="?", default=None, help="Text (or pipe stdin)")
     say_p.add_argument("--lang", default="en", help="Language (en, it)")
 
+    web_p = sub.add_parser("web", help="Start web server (browser AEC)")
+    web_p.add_argument("--target", default=None, help="tmux target pane")
+    web_p.add_argument("--host", default=None, help="Bind address (default: 0.0.0.0)")
+    web_p.add_argument("--port", type=int, default=None, help="Port (default: 8000)")
+
     sub.add_parser("status", help="Show status")
 
     args = parser.parse_args()
@@ -89,7 +106,7 @@ def main():
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    commands = {"start": cmd_start, "test": cmd_test, "say": cmd_say, "status": cmd_status}
+    commands = {"start": cmd_start, "test": cmd_test, "say": cmd_say, "web": cmd_web, "status": cmd_status}
 
     if args.command in commands:
         commands[args.command](args)

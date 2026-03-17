@@ -27,7 +27,7 @@ pvad:
 
 listener:
   input_device: "MacBook Air Microphone"
-  output_device: "AirPods"
+  output_device: "Multi-Output Device"
   polish_enabled: true
   polish_model: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
   chunk_ms: 30
@@ -41,6 +41,10 @@ listener:
   min_utterance_energy: 0.0005
   loopback_device: "BlackHole 2ch"
   aec_delay_ms: 10
+
+web:
+  host: "0.0.0.0"
+  port: 8000
 
 jarvis:
   tmux_target: "claude:0"
