@@ -143,11 +143,8 @@
         stopping: { label: 'STOPPING', cls: 'stopping' },
         stop:     { label: 'STOPPING', cls: 'stopping' },
     };
-    // Interruption detection thresholds (lowered for post-AEC audio)
-    const INT = {
-        RMS: 0.005, EXTRA: 0.003, RATIO: 1.15, ABS: 0.008,
-        MIN_FRAMES: 2, REQUIRED_FRAMES: 3,
-    };
+    // Barge-in detection: fixed threshold (AEC removes echo, so no adaptive needed)
+    const INT = { THRESHOLD: 0.01, REQUIRED_FRAMES: 3 };
 
     const dom = {
         conn:  document.getElementById('conn'),
@@ -175,29 +172,20 @@
         clear() { this.frames = []; },
     };
 
-    // Interruption detector
+    // Barge-in detector: simple fixed threshold (browser AEC handles echo)
     const intDet = {
-        frames: 0, pending: null, avg: 0, peak: 0, observed: 0,
-        reset() { this.frames = 0; this.pending = null; this.avg = 0; this.peak = 0; this.observed = 0; },
+        frames: 0,
+        reset() { this.frames = 0; },
         analyse(frame) {
             const v = rms(frame);
-            this.observed++;
-            this.avg = this.avg === 0 ? v : (0.9 * this.avg + 0.1 * v);
-            this.peak = Math.max(this.peak * 0.95, v);
-            if (this.observed < INT.MIN_FRAMES) return null;
-            const baseline = Math.max(this.avg, this.peak);
-            const threshold = Math.max(INT.RMS, this.avg + INT.EXTRA, baseline * INT.RATIO, INT.ABS);
-            if (v > threshold) {
+            if (v > INT.THRESHOLD) {
                 this.frames++;
-                if (this.frames === 1) this.pending = Float32Array.from(frame);
                 if (this.frames >= INT.REQUIRED_FRAMES) {
-                    const segs = this.pending ? [this.pending, Float32Array.from(frame)] : [Float32Array.from(frame)];
                     this.reset();
-                    return segs;
+                    return [Float32Array.from(frame)];
                 }
             } else {
                 this.frames = 0;
-                this.pending = null;
             }
             return null;
         },
@@ -364,7 +352,7 @@
         if (botSpeaking) {
             const burst = intDet.analyse(frame);
             if (burst) {
-                console.log('[interrupt] User speaking during TTS');
+                console.log('[interrupt] Barge-in detected, rms:', rms(frame).toFixed(4));
                 botSpeaking = false;
                 playback.stop({ notifyServer: true, updateUi: false });
                 const pre = audioBuf.getRecent(15);
@@ -372,7 +360,7 @@
                 burst.forEach(c => sendJson({ event: EVENTS.MEDIA, audio: f32ToB64(c) }));
                 audioBuf.clear();
             }
-            if (echoState.isEcho) return;
+            return;
         }
 
         if (micSuppressed && !botSpeaking) {
