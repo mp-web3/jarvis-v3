@@ -66,10 +66,22 @@ class SpeechDetector:
     """4-state VAD machine with audio segmentation and EOU detection.
 
     State machine: QUIET -> STARTING -> SPEAKING -> STOPPING -> QUIET
-    Much better than jarvis-v2's binary listening/not-listening toggle.
+
+    3-layer turn detection:
+    1. Silero VAD — detects speech start/stop (~30ms)
+    2. SmartTurn v3 — audio-level end-of-utterance (~12ms)
+    3. STT semantic — checks transcribed text for completeness (zero cost)
     """
 
-    def __init__(self):
+    # Words that signal the speaker hasn't finished
+    _INCOMPLETE_ENDINGS = frozenset({
+        "and", "but", "or", "so", "because", "that", "which", "who",
+        "where", "when", "if", "while", "the", "a", "an", "to", "of",
+        "in", "with", "for", "on", "at", "by", "from", "is", "are",
+        "was", "were", "not", "then", "also", "just", "about",
+    })
+
+    def __init__(self, text_provider=None):
         self.vad = SileroVAD()
         self.eou = EndOfUtteranceDetector()
         self.buffer = AudioBuffer()
@@ -81,6 +93,11 @@ class SpeechDetector:
 
         self.segment_count = 0
         self.current_segment: Optional[np.ndarray] = None
+
+        # Layer 3: STT semantic turn detection
+        self._text_provider = text_provider  # Callable[[], str] | None
+        self._semantic_wait_chunks = 0
+        self._semantic_max_wait = 30  # ~1s at 30ms/chunk
 
     def start_listening(self):
         self.is_listening = True
@@ -139,18 +156,36 @@ class SpeechDetector:
                     logger.info("EOU detected (conf: %.2f)", result["confidence"])
 
             if vad_quiet and eou_confirms:
-                self.state = SpeechState.QUIET
-                events.append(PipelineEvent.SPEECH_END)
-                if self.user_speaking:
-                    events.append(PipelineEvent.RESPOND)
-                    self.user_speaking = False
-                if self.eou.available:
-                    self.eou.reset()
-                self.current_segment = None
+                # Layer 3: semantic check — is the transcribed text complete?
+                should_wait = False
+                if self._text_provider and not self._text_complete():
+                    if self._semantic_wait_chunks < self._semantic_max_wait:
+                        self._semantic_wait_chunks += 1
+                        if self._semantic_wait_chunks == 1:
+                            text = self._text_provider() or ""
+                            logger.info(
+                                "Semantic: text incomplete, extending wait: '...%s'",
+                                text[-50:],
+                            )
+                        should_wait = True
+                    else:
+                        logger.info("Semantic: wait timeout, sending anyway")
+
+                if not should_wait:
+                    self._semantic_wait_chunks = 0
+                    self.state = SpeechState.QUIET
+                    events.append(PipelineEvent.SPEECH_END)
+                    if self.user_speaking:
+                        events.append(PipelineEvent.RESPOND)
+                        self.user_speaking = False
+                    if self.eou.available:
+                        self.eou.reset()
+                    self.current_segment = None
             elif vad_prob > VAD_SPEAKING_THRESHOLD:
                 # User resumed speaking (just a pause)
                 self.state = SpeechState.SPEAKING
                 self.current_segment = None
+                self._semantic_wait_chunks = 0
 
         if prev_state != self.state:
             logger.debug(
@@ -158,6 +193,34 @@ class SpeechDetector:
             )
 
         return events
+
+    def _text_complete(self) -> bool:
+        """Layer 3: check if accumulated text looks like a complete utterance."""
+        if not self._text_provider:
+            return True
+
+        text = (self._text_provider() or "").strip()
+        if not text:
+            return False  # No text yet — wait for transcription
+
+        # Ends with sentence-ending punctuation → definitely complete
+        if text[-1] in ".!?":
+            return True
+
+        words = text.split()
+
+        # Very short fragment (<3 words) without punctuation — likely incomplete
+        if len(words) < 3:
+            return False
+
+        # Ends with conjunction/preposition/article → likely mid-sentence
+        last_word = words[-1].lower().rstrip(",;:")
+        if last_word in self._INCOMPLETE_ENDINGS:
+            return False
+
+        # No clear signal either way — assume complete
+        # (Parakeet sometimes omits final punctuation on complete sentences)
+        return True
 
     def get_state(self) -> dict:
         return {

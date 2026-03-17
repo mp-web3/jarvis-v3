@@ -92,7 +92,7 @@ class JarvisListener:
     def __init__(self, resources: PipelineResources, tmux_target: str):
         self.resources = resources
         self.tmux_target = tmux_target
-        self.detector = SpeechDetector()
+        self.detector = SpeechDetector(text_provider=lambda: self._accumulated_text)
         self.config = get_config()
 
         self._running = False
