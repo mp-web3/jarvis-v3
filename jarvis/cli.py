@@ -4,6 +4,7 @@
 import argparse
 import logging
 import sys
+from pathlib import Path
 
 
 def cmd_start(args):
@@ -105,6 +106,11 @@ def main():
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Also log to file for remote debugging
+    fh = logging.FileHandler(str(Path(__file__).parent.parent / "jarvis.log"))
+    fh.setLevel(level)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(fh)
 
     commands = {"start": cmd_start, "test": cmd_test, "say": cmd_say, "web": cmd_web, "status": cmd_status}
 

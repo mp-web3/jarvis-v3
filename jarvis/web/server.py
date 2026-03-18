@@ -97,6 +97,10 @@ def _decode_float32_audio(data: str) -> np.ndarray | None:
         return None
 
 
+_active_connections = 0
+_conn_lock = asyncio.Lock()
+
+
 class WebVoicePipeline:
     """Per-connection voice pipeline for browser-based I/O."""
 
@@ -128,15 +132,19 @@ class WebVoicePipeline:
         self._polish_enabled = listener_cfg.get("polish_enabled", False)
 
     async def start(self):
+        global _active_connections
         self._transcription_task = asyncio.create_task(
             self._transcription_worker(),
         )
         self._tts_task = asyncio.create_task(self._watch_tts_queue())
-        VOICE_MODE_FLAG.touch()
+        async with _conn_lock:
+            _active_connections += 1
+            VOICE_MODE_FLAG.touch()
         await self._send_state()
-        logger.info("Web pipeline started")
+        logger.info("Web pipeline started (connections: %d)", _active_connections)
 
     async def shutdown(self):
+        global _active_connections
         self._tts_cancel.set()
         for task in (self._transcription_task, self._tts_task):
             if task:
@@ -145,10 +153,13 @@ class WebVoicePipeline:
                     await task
                 except asyncio.CancelledError:
                     pass
-        for flag in (VOICE_MODE_FLAG, SPEAKING_FLAG):
-            flag.unlink(missing_ok=True)
-        TTS_QUEUE.unlink(missing_ok=True)
-        logger.info("Web pipeline shutdown")
+        async with _conn_lock:
+            _active_connections = max(0, _active_connections - 1)
+            if _active_connections == 0:
+                for flag in (VOICE_MODE_FLAG, SPEAKING_FLAG):
+                    flag.unlink(missing_ok=True)
+                TTS_QUEUE.unlink(missing_ok=True)
+        logger.info("Web pipeline shutdown (connections: %d)", _active_connections)
 
     async def handle_message(self, payload: dict):
         event = payload.get("event")
@@ -158,6 +169,7 @@ class WebVoicePipeline:
             await self._send_state()
         elif event == "stop":
             if payload.get("target") == "playback":
+                logger.info("Client requested playback stop (barge-in?)")
                 self._tts_cancel.set()
             else:
                 self.detector.stop_listening()
@@ -165,6 +177,7 @@ class WebVoicePipeline:
         elif event == "media":
             await self._handle_audio(payload.get("audio"))
         elif event == "interrupt":
+            logger.info("Client sent interrupt")
             self._tts_cancel.set()
             await self._send_state()
 

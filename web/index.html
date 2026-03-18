@@ -128,7 +128,6 @@
         </div>
         <div class="note">Browser AEC enabled — no headphones required</div>
     </div>
-    <audio id="audioEl" style="display: none;"></audio>
 
     <script>
     const EVENTS = {
@@ -144,7 +143,7 @@
         stop:     { label: 'STOPPING', cls: 'stopping' },
     };
     // Barge-in detection: fixed threshold (AEC removes echo, so no adaptive needed)
-    const INT = { THRESHOLD: 0.01, REQUIRED_FRAMES: 3 };
+    const INT = { THRESHOLD: 0.05, REQUIRED_FRAMES: 5 };
 
     const dom = {
         conn:  document.getElementById('conn'),
@@ -154,11 +153,10 @@
         vad:   document.getElementById('mVad'),
         stt:   document.getElementById('mStt'),
         tts:   document.getElementById('mTts'),
-        audio: document.getElementById('audioEl'),
     };
 
     let ws = null, audioCtx = null, processorNode = null, mediaStream = null;
-    let correlatorNode = null, ttsSourceNode = null;
+    let correlatorNode = null;
     let isListening = false, micSuppressed = false, botSpeaking = false;
     let conversation = [];
     let echoState = { corr: 0, micRms: 0, refRms: 0, isEcho: false };
@@ -180,7 +178,9 @@
             const v = rms(frame);
             if (v > INT.THRESHOLD) {
                 this.frames++;
+                console.log('[barge-in] frame', this.frames, '/', INT.REQUIRED_FRAMES, 'rms:', v.toFixed(4));
                 if (this.frames >= INT.REQUIRED_FRAMES) {
+                    console.warn('[barge-in] TRIGGERED! rms:', v.toFixed(4));
                     this.reset();
                     return [Float32Array.from(frame)];
                 }
@@ -191,9 +191,11 @@
         },
     };
 
-    // Playback queue
+    // Playback queue — uses Web Audio API (not <audio> element) to keep
+    // mic and playback in the same AudioContext/session. Prevents iOS from
+    // killing getUserMedia when TTS plays.
     const playback = {
-        queue: [], active: false, url: null, finalizer: null,
+        queue: [], active: false, sourceNode: null,
         enqueue(buffer, mime = 'audio/wav') {
             if (!(buffer instanceof ArrayBuffer) || buffer.byteLength === 0) return;
             this.queue.push({ buffer, mime });
@@ -202,54 +204,42 @@
         stop({ notifyServer = false, updateUi = true } = {}) {
             const had = this.active || this.queue.length > 0;
             this.queue.length = 0;
-            if (dom.audio && !dom.audio.paused) {
-                dom.audio.pause(); dom.audio.currentTime = 0; dom.audio.onended = null;
+            if (this.sourceNode) {
+                try { this.sourceNode.onended = null; this.sourceNode.stop(); } catch (e) {}
+                this.sourceNode = null;
             }
             this.active = false; botSpeaking = false;
-            if (this.finalizer) { const fn = this.finalizer; this.finalizer = null; fn('interrupted', { updateUi }); }
-            else if (had) this._finalize('interrupted', { updateUi });
-            else if (updateUi) setIdle();
             setMicSuppressed(false);
+            if (updateUi) setIdle();
             if (notifyServer) sendJson({ event: EVENTS.STOP, target: 'playback' });
             return had;
         },
-        _next() {
+        async _next() {
             const item = this.queue.shift();
             if (!item) { this.active = false; botSpeaking = false; setMicSuppressed(false); setIdle(); return; }
             this.active = true; botSpeaking = true;
             setMicSuppressed(true);
-            if (this.url) URL.revokeObjectURL(this.url);
-            const blob = new Blob([item.buffer], { type: item.mime });
-            this.url = URL.createObjectURL(blob);
-            console.log('[playback] Playing blob:', blob.size, 'bytes, type:', blob.type);
-            dom.audio.src = this.url;
-            this.finalizer = (reason = 'natural', opts) => this._finalize(reason, opts);
-            dom.audio.onended = () => { console.log('[playback] Ended naturally'); this.finalizer('natural'); };
-            // Connect TTS reference for correlator after audio loads
-            dom.audio.oncanplay = () => {
-                if (audioCtx && correlatorNode && dom.audio.captureStream) {
-                    try {
-                        ttsSourceNode = audioCtx.createMediaStreamSource(dom.audio.captureStream());
-                        ttsSourceNode.connect(correlatorNode, 0, 1);
-                    } catch (e) { console.warn('captureStream ref:', e.message); }
-                }
-            };
-            dom.audio.play().then(() => {
-                console.log('[playback] play() succeeded');
-            }).catch((err) => {
-                console.error('[playback] play() FAILED:', err.name, err.message);
-                this.finalizer('interrupted');
-            });
+            try {
+                if (!audioCtx) { console.error('[playback] no AudioContext'); this._done(); return; }
+                console.log('[playback] decoding', item.buffer.byteLength, 'bytes');
+                const audioBuf2 = await audioCtx.decodeAudioData(item.buffer.slice(0));
+                console.log('[playback] playing', audioBuf2.duration.toFixed(2), 's @', audioBuf2.sampleRate, 'Hz');
+                const src = audioCtx.createBufferSource();
+                src.buffer = audioBuf2;
+                src.connect(audioCtx.destination);
+                src.onended = () => { console.log('[playback] ended naturally'); this.sourceNode = null; this._done(); };
+                this.sourceNode = src;
+                src.start();
+            } catch (err) {
+                console.error('[playback] failed:', err.message);
+                this._done();
+            }
         },
-        _finalize(reason = 'natural', { updateUi = true } = {}) {
-            dom.audio.onended = null; dom.audio.pause(); dom.audio.currentTime = 0; dom.audio.src = '';
-            if (this.url) { URL.revokeObjectURL(this.url); this.url = null; }
-            if (ttsSourceNode) { ttsSourceNode.disconnect(); ttsSourceNode = null; }
-            this.active = false; botSpeaking = false; this.finalizer = null;
+        _done() {
+            this.active = false; botSpeaking = false;
             setMicSuppressed(false);
-            if (reason === 'interrupted') this.queue.length = 0;
-            if (this.queue.length > 0 && reason !== 'interrupted') this._next();
-            else if (updateUi) setIdle();
+            if (this.queue.length > 0) this._next();
+            else setIdle();
         },
     };
 
@@ -303,7 +293,6 @@
     // Audio setup
     function teardownAudio() {
         if (correlatorNode) { correlatorNode.port.onmessage = null; correlatorNode.disconnect(); correlatorNode = null; }
-        if (ttsSourceNode) { ttsSourceNode.disconnect(); ttsSourceNode = null; }
         if (processorNode) { processorNode.disconnect(); processorNode.onaudioprocess = null; processorNode = null; }
         if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
         if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }

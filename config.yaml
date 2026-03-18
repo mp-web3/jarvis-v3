@@ -27,7 +27,7 @@ pvad:
 
 listener:
   input_device: "MacBook Air Microphone"
-  output_device: "Multi-Output Device"
+  output_device: "AirPods"
   polish_enabled: true
   polish_model: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
   chunk_ms: 30
