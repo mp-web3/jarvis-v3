@@ -324,7 +324,11 @@ class WebVoicePipeline:
 
     async def _send_tts(self, text: str):
         """Render TTS and send WAV bytes over WebSocket."""
-        from jarvis.speaker import get_sample_rate, render
+        from jarvis.speaker import get_sample_rate, render, sanitize_for_tts
+
+        text = sanitize_for_tts(text)
+        if not text:
+            return
 
         try:
             SPEAKING_FLAG.touch()

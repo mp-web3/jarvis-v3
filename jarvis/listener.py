@@ -135,6 +135,14 @@ class JarvisListener:
         self._text_buffer: list[str] = []
         self._debounce_task: asyncio.Task | None = None
 
+        # Acknowledgment
+        self._ack_enabled = listener_cfg.get("ack_enabled", True)
+
+        # Track when last utterance was sent (for continuation detection)
+        self._last_send_time: float = 0.0
+        self._continuation_window_s = listener_cfg.get("continuation_window_s", 2.0)
+        self._is_continuation = False
+
     async def run(self):
         loop = asyncio.get_running_loop()
         self._running = True
@@ -235,8 +243,22 @@ class JarvisListener:
 
     async def _handle_events(self, events: list[str]):
         if PipelineEvent.SPEECH_START in events:
+            # Continuation detection: if user speaks again shortly after
+            # their last utterance (within window) and TTS isn't playing,
+            # this is a follow-up thought — skip acknowledgment
+            elapsed = time.monotonic() - self._last_send_time
+            self._is_continuation = (
+                self._last_send_time > 0
+                and elapsed < self._continuation_window_s
+                and not self._tts_playing
+            )
+
+            if self._is_continuation:
+                logger.info("Continuation detected (%.1fs since last send)", elapsed)
+
             self._is_accumulating = True
             self._accumulated_text = ""
+
             # Interrupt TTS on barge-in
             if self._tts_playing and self._response_cancel_event:
                 self._response_cancel_event.set()
@@ -315,10 +337,32 @@ class JarvisListener:
             logger.debug("Filtered single word: %s", text)
             return
 
+        # Play acknowledgment before sending to Claude (skip on continuations)
+        if self._ack_enabled and not getattr(self, "_is_continuation", False):
+            await self._play_ack()
+        self._is_continuation = False
+
+        self._last_send_time = time.monotonic()
         print(f"[voice] {text}", file=sys.stderr)
         await asyncio.get_running_loop().run_in_executor(
             None, _send_to_tmux, text, self.tmux_target
         )
+
+    async def _play_ack(self):
+        """Play a pre-cached acknowledgment clip (non-blocking, no MLX lock needed)."""
+        from jarvis.speaker import get_random_ack, get_sample_rate
+
+        audio = get_random_ack()
+        if audio is None:
+            return
+
+        try:
+            sr = get_sample_rate()
+            sd.play(audio, samplerate=sr)
+            duration = len(audio) / sr
+            await asyncio.sleep(duration)
+        except Exception:
+            logger.exception("Ack playback failed")
 
     async def _classify_bargein(self):
         """Smart barge-in: transcribe the interruption to classify filler vs intentional."""
@@ -377,7 +421,11 @@ class JarvisListener:
             await asyncio.sleep(0.2)
 
     async def _play_tts(self, text: str):
-        from jarvis.speaker import get_sample_rate, render
+        from jarvis.speaker import get_sample_rate, render, sanitize_for_tts
+
+        text = sanitize_for_tts(text)
+        if not text:
+            return
 
         try:
             self._tts_playing = True

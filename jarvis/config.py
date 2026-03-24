@@ -55,7 +55,7 @@ STT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
 # TTS
 TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
 TTS_VOICE = "af_heart"
-TTS_SPEED = 1.0
+TTS_SPEED = float(get_config().get("tts", {}).get("speed", 1.2))
 TTS_SAMPLE_RATE = 24000
 
 # Polish (transcript cleanup LLM)

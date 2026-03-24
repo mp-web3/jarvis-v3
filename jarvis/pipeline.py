@@ -46,7 +46,7 @@ class PipelineResources:
 
     def __init__(self):
         from jarvis.transcriber import preload as preload_stt
-        from jarvis.speaker import preload as preload_tts
+        from jarvis.speaker import preload as preload_tts, preload_acknowledgments
         from jarvis.polisher import preload as preload_polish
 
         logger.info("Initializing pipeline resources...")
@@ -54,6 +54,7 @@ class PipelineResources:
         # Pre-load models on main thread (Metal GPU safety)
         preload_stt()
         preload_tts()
+        preload_acknowledgments()
         preload_polish()
 
         # MLX lock — prevents concurrent Parakeet STT + Kokoro TTS on Metal
