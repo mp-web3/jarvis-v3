@@ -1,13 +1,11 @@
 """Jarvis v3 listener — tmux mode.
 
-VAD-gated STT with tmux output. Reuses PipelineResources and SpeechDetector
-from pipeline.py but routes output to tmux send-keys instead of WebSocket.
+Streams mic audio to Deepgram for STT + turn detection, then routes
+transcribed text to tmux send-keys for Claude Code injection.
 
-Key improvements over v2:
-- asyncio.Lock for MLX safety (not flag-based)
-- 4-state VAD machine (not binary)
-- EOU detection (not fixed silence timer)
-- Event-based barge-in cancellation
+Barge-in during TTS uses Silero VAD (local, CPU) to detect speech,
+pauses Deepgram streaming to avoid echo feedback, and resumes after
+TTS is cancelled.
 """
 
 import asyncio
@@ -22,8 +20,9 @@ from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
-from jarvis.config import CHUNK_SIZE, MIN_SEGMENT_DURATION, SAMPLE_RATE, VAD_START_THRESHOLD, get_config
-from jarvis.pipeline import PipelineEvent, PipelineResources, SpeechDetector
+from jarvis.config import CHUNK_SIZE, SAMPLE_RATE, VAD_START_THRESHOLD, get_config
+from jarvis.pipeline import PipelineResources
+from jarvis.transcriber import DeepgramTranscriber
 from jarvis.vad import SileroVAD
 
 logger = logging.getLogger(__name__)
@@ -31,7 +30,6 @@ logger = logging.getLogger(__name__)
 VOICE_MODE_FLAG = Path.home() / ".claude" / ".voice-mode"
 SPEAKING_FLAG = Path.home() / ".claude" / ".speaking"
 TTS_QUEUE = Path.home() / ".claude" / ".tts-queue"
-SPEAKER_EMBEDDING = Path(__file__).parent.parent / "speaker_embedding_ecapa.npy"
 
 EXIT_PHRASES = {"stop jarvis", "jarvis stop", "esci jarvis"}
 
@@ -43,7 +41,6 @@ _FILLERS = re.compile(
 )
 
 # Filler-only patterns for barge-in classification (en + it)
-# These are utterances that should NOT interrupt TTS
 _BARGEIN_FILLER = re.compile(
     r"^(uh|uhm|um|umm|ah|eh|er|erm|hmm|hm|mm|mhm|uh huh|oh|okay|ok|right|yeah"
     r"|yes|no|sure|huh|wow|whoa|ooh|aah"
@@ -54,13 +51,9 @@ _BARGEIN_FILLER = re.compile(
 
 def _clean_transcript(text: str) -> str:
     """Remove filler words and deduplicate consecutive repeated words."""
-    # Strip fillers
     text = _FILLERS.sub("", text)
-    # Deduplicate consecutive repeated words: "the the" → "the"
     text = re.sub(r"\b(\w+)(\s+\1)+\b", r"\1", text, flags=re.IGNORECASE)
-    # Collapse whitespace
     text = re.sub(r"\s{2,}", " ", text).strip()
-    # Fix orphaned punctuation from filler removal
     text = re.sub(r"\s+([.,!?])", r"\1", text)
     return text
 
@@ -96,26 +89,21 @@ def _send_to_tmux(text: str, target: str):
 
 
 class JarvisListener:
-    """tmux-mode listener using shared pipeline components."""
+    """tmux-mode listener using Deepgram streaming STT."""
 
     def __init__(self, resources: PipelineResources, tmux_target: str):
         self.resources = resources
         self.tmux_target = tmux_target
-        self.detector = SpeechDetector(text_provider=lambda: self._accumulated_text)
         self.config = get_config()
 
         self._running = False
         self._tts_playing = False
         self._tts_settling = False
 
-        # Transcription
-        self._transcription_queue: asyncio.Queue = asyncio.Queue(maxsize=256)
-        self._accumulated_text = ""
-        self._is_accumulating = False
-
-        # Polish (LLM transcript cleanup)
+        # Deepgram transcriber
         listener_cfg = self.config.get("listener", {})
-        self._polish_enabled = listener_cfg.get("polish_enabled", False)
+        debounce_s = listener_cfg.get("debounce_ms", 300) / 1000.0
+        self.transcriber = DeepgramTranscriber(debounce_s=debounce_s)
 
         # Barge-in
         self._response_cancel_event: asyncio.Event | None = None
@@ -125,15 +113,8 @@ class JarvisListener:
         bargein_ms = listener_cfg.get("bargein_sustain_ms", 800)
         self._bargein_threshold = max(1, int(bargein_ms / chunk_ms))
         self._bargein_count = 0
-        self._bargein_vad = SileroVAD()  # separate VAD instance for barge-in
-        self._bargein_buffer: list[np.ndarray] = []  # audio buffer for smart barge-in
-        self._bargein_classifying = False  # prevent re-entry during classification
-
-        # Debounce for tmux (combine rapid utterances)
-        debounce_ms = listener_cfg.get("debounce_ms", 300)
-        self._debounce_s = debounce_ms / 1000.0
-        self._text_buffer: list[str] = []
-        self._debounce_task: asyncio.Task | None = None
+        self._bargein_vad = SileroVAD()
+        self._bargein_buffer: list[np.ndarray] = []
 
         # Acknowledgment
         self._ack_enabled = listener_cfg.get("ack_enabled", True)
@@ -146,7 +127,6 @@ class JarvisListener:
     async def run(self):
         loop = asyncio.get_running_loop()
         self._running = True
-        self.detector.start_listening()
 
         queue: asyncio.Queue[np.ndarray] = asyncio.Queue()
 
@@ -182,11 +162,12 @@ class JarvisListener:
         stream.start()
 
         VOICE_MODE_FLAG.touch()
-        transcription_task = asyncio.create_task(self._transcription_worker())
+        await self.transcriber.start()
+        utterance_task = asyncio.create_task(self._utterance_worker())
         tts_task = asyncio.create_task(self._watch_tts_queue())
 
         print(
-            "Jarvis v3 active (Parakeet TDT + Kokoro + Silero VAD + EOU). "
+            "Jarvis v3 active (Deepgram STT + Kokoro TTS). "
             "Speak naturally. Say 'stop Jarvis' to quit.",
             file=sys.stderr,
         )
@@ -202,9 +183,9 @@ class JarvisListener:
                 if self._tts_settling:
                     continue
 
-                # During TTS: run VAD for barge-in detection
+                # During TTS: run Silero VAD for barge-in (don't stream to Deepgram)
                 if self._tts_playing:
-                    if self._bargein_enabled and self._response_cancel_event and not self._bargein_classifying:
+                    if self._bargein_enabled and self._response_cancel_event:
                         vad_prob = self._bargein_vad.process_chunk(chunk)
                         self._bargein_buffer.append(chunk)
                         if vad_prob >= VAD_START_THRESHOLD:
@@ -221,109 +202,53 @@ class JarvisListener:
                                 self._bargein_count = 0
                         else:
                             self._bargein_count = 0
-                        # Keep buffer trimmed when no barge-in triggered
+                        # Keep buffer trimmed
                         max_buf = self._bargein_threshold * 3
                         if len(self._bargein_buffer) > max_buf:
                             self._bargein_buffer = self._bargein_buffer[-max_buf:]
                     continue
 
-                events = self.detector.process_chunk(chunk)
-                await self._handle_events(events)
+                # Normal: stream audio to Deepgram
+                await self.transcriber.send_audio(chunk)
 
         except asyncio.CancelledError:
             pass
         finally:
             stream.stop()
             stream.close()
-            transcription_task.cancel()
+            await self.transcriber.stop()
+            utterance_task.cancel()
             tts_task.cancel()
             for f in (VOICE_MODE_FLAG, SPEAKING_FLAG, TTS_QUEUE):
                 f.unlink(missing_ok=True)
             print("\nJarvis v3 stopped.", file=sys.stderr)
 
-    async def _handle_events(self, events: list[str]):
-        if PipelineEvent.SPEECH_START in events:
-            # Continuation detection: if user speaks again shortly after
-            # their last utterance (within window) and TTS isn't playing,
-            # this is a follow-up thought — skip acknowledgment
-            elapsed = time.monotonic() - self._last_send_time
-            self._is_continuation = (
-                self._last_send_time > 0
-                and elapsed < self._continuation_window_s
-                and not self._tts_playing
-            )
-
-            if self._is_continuation:
-                logger.info("Continuation detected (%.1fs since last send)", elapsed)
-
-            self._is_accumulating = True
-            self._accumulated_text = ""
-
-            # Interrupt TTS on barge-in
-            if self._tts_playing and self._response_cancel_event:
-                self._response_cancel_event.set()
-
-        for event in events:
-            if event == PipelineEvent.TRANSCRIBE:
-                await self._queue_transcription()
-            elif event == PipelineEvent.RESPOND:
-                await self._finalize_and_send()
-
-    async def _queue_transcription(self):
-        segment = self.detector.current_segment
-        if segment is None or len(segment) < SAMPLE_RATE * MIN_SEGMENT_DURATION:
-            return
-        self.detector.segment_count += 1
-        try:
-            self._transcription_queue.put_nowait(
-                (self.detector.segment_count, segment)
-            )
-        except asyncio.QueueFull:
-            logger.warning("Transcription queue full")
-
-    async def _transcription_worker(self):
-        from jarvis.transcriber import transcribe
-
-        while True:
-            segment_id, audio = await self._transcription_queue.get()
+    async def _utterance_worker(self):
+        """Consume complete utterances from Deepgram and send to tmux."""
+        while self._running:
             try:
-                async with self.resources.mlx_lock:
-                    text = await asyncio.get_running_loop().run_in_executor(
-                        None, transcribe, audio, SAMPLE_RATE
-                    )
-                if text and text.strip():
-                    logger.info("Transcribed #%d: %s", segment_id, text)
-                    if self._is_accumulating:
-                        if self._accumulated_text:
-                            self._accumulated_text += " " + text.strip()
-                        else:
-                            self._accumulated_text = text.strip()
-            except Exception:
-                logger.exception("Transcription error")
-            finally:
-                self._transcription_queue.task_done()
-
-    async def _finalize_and_send(self):
-        await self._transcription_queue.join()
-
-        self._is_accumulating = False
-        if not self._accumulated_text:
-            return
-
-        raw_text = self._accumulated_text.strip()
-        self._accumulated_text = ""
-
-        # Polish with LLM or fall back to regex cleanup
-        if self._polish_enabled:
-            from jarvis.polisher import polish
-
-            async with self.resources.mlx_lock:
-                text = await asyncio.get_running_loop().run_in_executor(
-                    None, polish, raw_text
+                text = await asyncio.wait_for(
+                    self.transcriber.ready_queue.get(), timeout=1.0
                 )
-        else:
-            text = _clean_transcript(raw_text)
+            except asyncio.TimeoutError:
+                continue
 
+            await self._process_utterance(text)
+
+    async def _process_utterance(self, raw_text: str):
+        """Clean, filter, and send an utterance to tmux."""
+        # Continuation detection
+        elapsed = time.monotonic() - self._last_send_time
+        self._is_continuation = (
+            self._last_send_time > 0
+            and elapsed < self._continuation_window_s
+            and not self._tts_playing
+        )
+        if self._is_continuation:
+            logger.info("Continuation detected (%.1fs since last send)", elapsed)
+
+        # Clean transcript (regex only — Deepgram transcripts are already clean)
+        text = _clean_transcript(raw_text)
         if raw_text != text:
             logger.debug("Cleaned: '%s' → '%s'", raw_text, text)
 
@@ -337,8 +262,8 @@ class JarvisListener:
             logger.debug("Filtered single word: %s", text)
             return
 
-        # Play acknowledgment before sending to Claude (skip on continuations)
-        if self._ack_enabled and not getattr(self, "_is_continuation", False):
+        # Play acknowledgment (skip on continuations)
+        if self._ack_enabled and not self._is_continuation:
             await self._play_ack()
         self._is_continuation = False
 
@@ -349,7 +274,7 @@ class JarvisListener:
         )
 
     async def _play_ack(self):
-        """Play a pre-cached acknowledgment clip (non-blocking, no MLX lock needed)."""
+        """Play a pre-cached acknowledgment clip."""
         from jarvis.speaker import get_random_ack, get_sample_rate
 
         audio = get_random_ack()
@@ -365,50 +290,51 @@ class JarvisListener:
             logger.exception("Ack playback failed")
 
     async def _classify_bargein(self):
-        """Smart barge-in: transcribe the interruption to classify filler vs intentional."""
-        from jarvis.transcriber import transcribe
+        """Smart barge-in: send buffered audio to Deepgram for classification.
 
-        self._bargein_classifying = True
+        If the transcribed text is a filler word, resume TTS. Otherwise cancel it.
+        Since Deepgram is streaming, we send the buffered audio and wait briefly
+        for a transcript to classify.
+        """
         try:
             audio = np.concatenate(self._bargein_buffer)
             self._bargein_buffer.clear()
 
-            # Quick transcription of the barge-in segment
-            async with self.resources.mlx_lock:
-                text = await asyncio.get_running_loop().run_in_executor(
-                    None, transcribe, audio, SAMPLE_RATE
+            # Send buffered audio to Deepgram for transcription
+            await self.transcriber.send_audio(audio)
+
+            # Wait briefly for a transcript
+            try:
+                await asyncio.wait_for(
+                    self.transcriber.speech_detected.wait(), timeout=0.8
                 )
-
-            if not text or not text.strip():
-                logger.info("Barge-in: no speech detected, resuming TTS")
+                self.transcriber.speech_detected.clear()
+            except asyncio.TimeoutError:
+                logger.info("Barge-in: no transcript received, cancelling TTS")
+                self._response_cancel_event.set()
                 return
 
-            clean = text.strip()
-            lower = clean.lower().rstrip(".!?,")
+            # Check accumulated text for filler classification
+            text = self.transcriber._accumulated.strip()
+            if not text:
+                logger.info("Barge-in: empty transcript, resuming TTS")
+                return
 
-            # Check if it's filler
+            lower = text.lower().rstrip(".!?,")
             if _BARGEIN_FILLER.match(lower):
-                logger.info("Barge-in: filler ('%s'), resuming TTS", clean)
+                logger.info("Barge-in: filler ('%s'), resuming TTS", text)
                 return
 
-            # Intentional interruption — cancel TTS
-            logger.info("Barge-in: intentional ('%s'), cancelling TTS", clean)
+            # Intentional interruption
+            logger.info("Barge-in: intentional ('%s'), cancelling TTS", text)
             self._response_cancel_event.set()
-
-            # Feed transcribed text into accumulator for processing
-            self._accumulated_text = clean
-            self._is_accumulating = True
 
         except Exception:
             logger.exception("Barge-in classification failed, cancelling TTS")
             self._response_cancel_event.set()
-        finally:
-            self._bargein_classifying = False
 
     async def _watch_tts_queue(self):
         """Poll for TTS text queued by voice output hook."""
-        from jarvis.speaker import get_sample_rate, render
-
         while self._running:
             try:
                 if TTS_QUEUE.exists():
@@ -456,7 +382,6 @@ class JarvisListener:
                 await asyncio.sleep(0.15)
                 self._tts_settling = False
                 self._bargein_vad.reset()
-                self.detector.vad.reset()
                 logger.info("TTS interrupted, settled")
             else:
                 logger.info("TTS finished")
@@ -468,7 +393,6 @@ class JarvisListener:
             self._tts_settling = False
             self._bargein_count = 0
             self._bargein_buffer.clear()
-            self._bargein_classifying = False
             self._response_cancel_event = None
             SPEAKING_FLAG.unlink(missing_ok=True)
 

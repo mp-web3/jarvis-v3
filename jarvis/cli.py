@@ -2,6 +2,7 @@
 """Jarvis v3 CLI — voice interface for Claude Code."""
 
 import argparse
+import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -18,12 +19,16 @@ def cmd_start(args):
 
 
 def cmd_test(args):
-    """Quick mic + transcription test."""
+    """Quick mic + Deepgram transcription test."""
     import numpy as np
     import sounddevice as sd
 
-    from jarvis.config import SAMPLE_RATE
-    from jarvis.transcriber import transcribe
+    from jarvis.config import SAMPLE_RATE, DEEPGRAM_API_KEY
+    from jarvis.transcriber import DeepgramTranscriber, _float32_to_int16_bytes
+
+    if not DEEPGRAM_API_KEY:
+        print("Error: DEEPGRAM_API_KEY not set.", file=sys.stderr)
+        sys.exit(1)
 
     duration = 5
     print(f"Recording {duration} seconds...", file=sys.stderr)
@@ -31,8 +36,30 @@ def cmd_test(args):
     sd.wait()
     audio = audio[:, 0]
 
-    print("Transcribing with Parakeet TDT...", file=sys.stderr)
-    text = transcribe(audio, SAMPLE_RATE)
+    print("Transcribing with Deepgram...", file=sys.stderr)
+
+    async def _test_transcribe():
+        transcriber = DeepgramTranscriber(debounce_s=1.0)
+        await transcriber.start()
+
+        # Send recorded audio in chunks
+        chunk_size = 4096
+        for i in range(0, len(audio), chunk_size):
+            chunk = audio[i:i + chunk_size]
+            await transcriber.send_audio(chunk)
+            await asyncio.sleep(0.01)  # pace the sending
+
+        # Wait for transcripts
+        await asyncio.sleep(2.0)
+        await transcriber.stop()
+
+        # Collect all results
+        results = []
+        while not transcriber.ready_queue.empty():
+            results.append(transcriber.ready_queue.get_nowait())
+        return " ".join(results) if results else transcriber._accumulated.strip()
+
+    text = asyncio.run(_test_transcribe())
     print(f"Text: {text}" if text else "(no speech detected)")
 
 
@@ -59,26 +86,24 @@ def cmd_web(args):
 
 def cmd_status(args):
     """Show Jarvis v3 status."""
-    from pathlib import Path
-
-    from jarvis.config import STT_MODEL, TTS_MODEL, TTS_VOICE, PVAD_MODEL_DIR, SILERO_VAD_MODEL, EOU_MODEL
+    from jarvis.config import (
+        DEEPGRAM_API_KEY,
+        DEEPGRAM_MODEL,
+        DEEPGRAM_LANGUAGE,
+        TTS_MODEL,
+        TTS_VOICE,
+        SILERO_VAD_MODEL,
+    )
 
     print("Jarvis v3")
-    print(f"  STT: Parakeet TDT ({STT_MODEL})")
+    print(f"  STT: Deepgram ({DEEPGRAM_MODEL})")
+    print(f"  STT language: {DEEPGRAM_LANGUAGE}")
+    print(f"  Deepgram API key: {'set' if DEEPGRAM_API_KEY else 'MISSING'}")
     print(f"  TTS: Kokoro ({TTS_MODEL})")
     print(f"  TTS voice: {TTS_VOICE}")
 
     silero_path = Path(__file__).parent.parent / SILERO_VAD_MODEL
     print(f"  Silero VAD: {'found' if silero_path.exists() else 'MISSING'}")
-
-    pvad_path = Path(__file__).parent.parent / PVAD_MODEL_DIR / "pvad.onnx"
-    print(f"  pVAD model: {'found' if pvad_path.exists() else 'MISSING'}")
-
-    eou_path = Path(__file__).parent.parent / EOU_MODEL
-    print(f"  EOU model: {'found' if eou_path.exists() else 'MISSING'}")
-
-    emb_path = Path(__file__).parent.parent / "speaker_embedding_ecapa.npy"
-    print(f"  Speaker enrollment: {'yes' if emb_path.exists() else 'no'}")
 
 
 def main():

@@ -1,10 +1,10 @@
 [project]
 name = "jarvis-v3"
-version = "0.1.0"
-description = "Voice interface for Claude Code — Parakeet STT + MLX TTS on Apple Silicon"
+version = "0.2.0"
+description = "Voice interface for Claude Code — Deepgram STT + Kokoro MLX TTS"
 requires-python = ">=3.12"
 dependencies = [
-    "parakeet-mlx>=0.5",
+    "deepgram-sdk>=5.0",
     "mlx-audio[tts]>=0.3",
     "sounddevice>=0.5",
     "numpy>=1.26",
@@ -12,16 +12,16 @@ dependencies = [
     "pyyaml>=6",
     "onnxruntime>=1.17",
     "scipy>=1.12",
-    "transformers>=4.37",
-    "spacy>=3.8",
-    "en_core_web_sm@https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
-    "mlx-lm>=0.31.1",
 ]
 
 [project.optional-dependencies]
 web = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
 
 [project.scripts]

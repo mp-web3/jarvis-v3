@@ -1,12 +1,8 @@
 """Jarvis v3 web server — browser-based voice I/O with echo cancellation.
 
-Runs ML models server-side (Parakeet STT, Kokoro TTS, Silero VAD, SmartTurn EOU)
-and streams audio to/from a browser client over WebSocket. The browser provides
-hardware-accelerated AEC via getUserMedia({ echoCancellation: true }), enabling
-speaker-free operation without headphones.
-
-Output goes to Claude via tmux (same as listener.py). Claude's response comes
-back through the voice-output-hook -> .tts-queue -> TTS -> WebSocket -> browser.
+Streams browser audio to Deepgram for STT, sends transcribed text to Claude
+via tmux. Claude's response comes back through the voice-output-hook ->
+.tts-queue -> TTS -> WebSocket -> browser.
 """
 
 import asyncio
@@ -25,15 +21,9 @@ import soundfile as sf
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 
-from jarvis.audio_buffer import split_audio_into_chunks
-from jarvis.config import (
-    CHUNK_SIZE,
-    MAX_TRANSCRIPTION_QUEUE_SIZE,
-    MIN_SEGMENT_DURATION,
-    SAMPLE_RATE,
-    get_config,
-)
-from jarvis.pipeline import PipelineEvent, PipelineResources, SpeechDetector
+from jarvis.config import SAMPLE_RATE, get_config
+from jarvis.pipeline import PipelineResources
+from jarvis.transcriber import DeepgramTranscriber
 
 logger = logging.getLogger(__name__)
 
@@ -113,40 +103,32 @@ class WebVoicePipeline:
         self.ws = ws
         self.resources = resources
         self.tmux_target = tmux_target
-        self.detector = SpeechDetector(
-            text_provider=lambda: self._accumulated_text,
-        )
         self.config = get_config()
 
-        self._transcription_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=MAX_TRANSCRIPTION_QUEUE_SIZE,
-        )
-        self._accumulated_text = ""
-        self._is_accumulating = False
-        self._transcription_task: asyncio.Task | None = None
+        listener_cfg = self.config.get("listener", {})
+        debounce_s = listener_cfg.get("debounce_ms", 300) / 1000.0
+        self.transcriber = DeepgramTranscriber(debounce_s=debounce_s)
+        self._listening = False
 
         self._tts_task: asyncio.Task | None = None
         self._tts_cancel = asyncio.Event()
-
-        listener_cfg = self.config.get("listener", {})
-        self._polish_enabled = listener_cfg.get("polish_enabled", False)
+        self._utterance_task: asyncio.Task | None = None
 
     async def start(self):
         global _active_connections
-        self._transcription_task = asyncio.create_task(
-            self._transcription_worker(),
-        )
+        await self.transcriber.start()
+        self._utterance_task = asyncio.create_task(self._utterance_worker())
         self._tts_task = asyncio.create_task(self._watch_tts_queue())
         async with _conn_lock:
             _active_connections += 1
             VOICE_MODE_FLAG.touch()
-        await self._send_state()
         logger.info("Web pipeline started (connections: %d)", _active_connections)
 
     async def shutdown(self):
         global _active_connections
         self._tts_cancel.set()
-        for task in (self._transcription_task, self._tts_task):
+        await self.transcriber.stop()
+        for task in (self._utterance_task, self._tts_task):
             if task:
                 task.cancel()
                 try:
@@ -165,128 +147,51 @@ class WebVoicePipeline:
         event = payload.get("event")
 
         if event == "start":
-            self.detector.start_listening()
-            await self._send_state()
+            self._listening = True
+            await self._send_json({"event": "state", "listening": True})
         elif event == "stop":
             if payload.get("target") == "playback":
                 logger.info("Client requested playback stop (barge-in?)")
                 self._tts_cancel.set()
             else:
-                self.detector.stop_listening()
-            await self._send_state()
+                self._listening = False
+            await self._send_json({"event": "state", "listening": self._listening})
         elif event == "media":
             await self._handle_audio(payload.get("audio"))
         elif event == "interrupt":
             logger.info("Client sent interrupt")
             self._tts_cancel.set()
-            await self._send_state()
 
     async def _handle_audio(self, audio_data: str | None):
-        if not audio_data:
+        if not audio_data or not self._listening:
             return
         audio = _decode_float32_audio(audio_data)
         if audio is None or len(audio) == 0:
             return
-        for chunk in split_audio_into_chunks(audio, CHUNK_SIZE):
-            events = self.detector.process_chunk(chunk)
-            if events:
-                await self._handle_events(events)
-        await self._send_state()
+        # Forward audio to Deepgram
+        await self.transcriber.send_audio(audio)
 
-    async def _handle_events(self, events: list[str]):
-        if PipelineEvent.SPEECH_START in events:
-            self._is_accumulating = True
-            self._accumulated_text = ""
-
-        for event in events:
-            if event == PipelineEvent.TRANSCRIBE:
-                await self._queue_transcription()
-            elif event == PipelineEvent.RESPOND:
-                await self._finalize_and_send()
-            elif event in (
-                PipelineEvent.SPEECH_START,
-                PipelineEvent.SPEECH_END,
-            ):
-                await self._send_json({"event": event})
-
-    async def _queue_transcription(self):
-        segment = self.detector.current_segment
-        if segment is None or len(segment) < SAMPLE_RATE * MIN_SEGMENT_DURATION:
-            return
-        self.detector.segment_count += 1
-        try:
-            self._transcription_queue.put_nowait(
-                (self.detector.segment_count, segment),
-            )
-        except asyncio.QueueFull:
-            logger.warning("Transcription queue full")
-
-    async def _transcription_worker(self):
-        from jarvis.transcriber import transcribe
-
+    async def _utterance_worker(self):
+        """Consume utterances from Deepgram and process them."""
         while True:
-            segment_id, audio = await self._transcription_queue.get()
             try:
-                stt_start = time.monotonic()
-                async with self.resources.mlx_lock:
-                    text = await asyncio.get_running_loop().run_in_executor(
-                        None, transcribe, audio, SAMPLE_RATE,
-                    )
-                stt_latency = time.monotonic() - stt_start
-
-                await self._send_json({
-                    "event": "metrics",
-                    "metrics": {"stt": {"latency": stt_latency}},
-                })
-
-                if text and text.strip():
-                    logger.info(
-                        "STT #%d (%.2fs): %s", segment_id, stt_latency, text,
-                    )
-                    if self._is_accumulating:
-                        if self._accumulated_text:
-                            self._accumulated_text += " " + text.strip()
-                        else:
-                            self._accumulated_text = text.strip()
-
-                        await self._send_json({
-                            "event": "text",
-                            "role": "user",
-                            "text": text.strip(),
-                            "partial": True,
-                        })
-            except Exception:
-                logger.exception("Transcription error")
-            finally:
-                self._transcription_queue.task_done()
-
-    async def _finalize_and_send(self):
-        await self._transcription_queue.join()
-        self._is_accumulating = False
-
-        if not self._accumulated_text:
-            return
-
-        raw_text = self._accumulated_text.strip()
-        self._accumulated_text = ""
-
-        if self._polish_enabled:
-            from jarvis.polisher import polish
-
-            async with self.resources.mlx_lock:
-                text = await asyncio.get_running_loop().run_in_executor(
-                    None, polish, raw_text,
+                text = await asyncio.wait_for(
+                    self.transcriber.ready_queue.get(), timeout=1.0
                 )
-        else:
-            text = _clean_transcript(raw_text)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
 
-        if raw_text != text:
-            logger.debug("Cleaned: '%s' -> '%s'", raw_text, text)
+            await self._process_utterance(text)
+
+    async def _process_utterance(self, raw_text: str):
+        text = _clean_transcript(raw_text)
 
         lower = text.lower().rstrip(".!?,")
         if lower in EXIT_PHRASES:
             logger.info("Exit phrase detected")
-            self.detector.stop_listening()
+            self._listening = False
             await self._send_json({"event": "stop", "target": "listening"})
             return
 
@@ -370,10 +275,6 @@ class WebVoicePipeline:
             logger.exception("TTS failed")
         finally:
             SPEAKING_FLAG.unlink(missing_ok=True)
-
-    async def _send_state(self):
-        state = self.detector.get_state()
-        await self._send_json({"event": "state", **state})
 
     async def _send_json(self, payload: dict):
         try:
