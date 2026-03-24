@@ -23,43 +23,30 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SIZE = 512  # 32ms at 16kHz (matches offline-voice-ai)
 
-# VAD — Silero (generic, always-on)
-SILERO_VAD_MODEL = "models/silero_vad.onnx"
-VAD_ALPHA = 0.1
+# VAD thresholds — used for local barge-in energy gating
 VAD_START_THRESHOLD = 0.3
 VAD_SPEAKING_THRESHOLD = 0.5
 VAD_STOP_THRESHOLD = 0.3
 VAD_QUIET_THRESHOLD = 0.05
-VAD_STATE_SHAPE = (2, 1, 128)
-VAD_CONTEXT_SIZE = 64
-
-# pVAD — FireRedChat (personalized, speaker-verified)
-PVAD_MODEL_DIR = "models/pvad"
-PVAD_ACTIVATION_THRESHOLD = 0.85
-PVAD_MIN_SPEECH_FRAMES = 10
-PVAD_MIN_SILENCE_FRAMES = 20
-
-# End-of-utterance detection (SmartTurn)
-EOU_MODEL = "models/smart_turn_v3.onnx"
-EOU_MIN_SAMPLES = 4 * SAMPLE_RATE
-EOU_OPTIMAL_SAMPLES = 8 * SAMPLE_RATE
-EOU_CONFIDENCE_THRESHOLD = 0.9
 
 # Speech segmentation
 SAFETY_CHUNKS_BEFORE = 4
 MIN_SEGMENT_DURATION = 0.3
 
-# STT
-STT_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+# OpenAI Realtime API — STT (server-side VAD + gpt-4o-transcribe)
+OPENAI_STT_MODEL: str = get_config().get("stt", {}).get("model", "gpt-4o-transcribe")
+OPENAI_VAD_THRESHOLD: float = float(
+    get_config().get("listener", {}).get("vad_threshold", 0.5)
+)
+OPENAI_VAD_SILENCE_MS: int = int(
+    get_config().get("listener", {}).get("silence_ms", 500)
+)
+OPENAI_VAD_PREFIX_PADDING_MS: int = 300
 
-# TTS
-TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
-TTS_VOICE = "af_heart"
-TTS_SPEED = float(get_config().get("tts", {}).get("speed", 1.2))
-TTS_SAMPLE_RATE = 24000
-
-# Polish (transcript cleanup LLM)
-POLISH_MODEL = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
+# OpenAI TTS (/v1/audio/speech)
+OPENAI_TTS_MODEL: str = get_config().get("tts", {}).get("model", "tts-1")
+OPENAI_TTS_VOICE: str = get_config().get("tts", {}).get("voice", "nova")
+OPENAI_TTS_SAMPLE_RATE = 24000
 
 # LLM sentence streaming
 LLM_SENTENCE_DELIMITERS = ".!?"

@@ -3,44 +3,29 @@ audio:
   channels: 1
 
 stt:
-  model: "mlx-community/parakeet-tdt-0.6b-v3"
+  # OpenAI Realtime API model for transcription
+  model: "gpt-4o-transcribe"
 
 tts:
-  model: "mlx-community/Kokoro-82M-bf16"
-  voice: "af_heart"
-  lang_code: "a"
-  speed: 1.0
+  # OpenAI TTS model: tts-1 (fast) or tts-1-hd (higher quality)
+  model: "tts-1"
+  # OpenAI voice: alloy, echo, fable, onyx, nova, shimmer
+  voice: "nova"
   sample_rate: 24000
-  voices:
-    en:
-      voice: "af_heart"
-      lang_code: "a"
-    it:
-      voice: "if_sara"
-      lang_code: "i"
-
-pvad:
-  activation_threshold: 0.85
-  model_dir: "models/pvad"
-  min_speech_frames: 10
-  min_silence_frames: 20
 
 listener:
   input_device: "MacBook Air Microphone"
   output_device: "AirPods"
-  polish_enabled: true
-  polish_model: "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
   chunk_ms: 30
   ring_buffer_ms: 800
-  silence_ms: 700
+  # Server-side VAD settings (OpenAI Realtime API)
+  vad_threshold: 0.5
+  silence_ms: 500
   min_speech_s: 0.4
   debounce_ms: 300
   bargein_enabled: true
-  bargein_smart: true
   bargein_sustain_ms: 400
   min_utterance_energy: 0.0005
-  loopback_device: "BlackHole 2ch"
-  aec_delay_ms: 10
 
 web:
   host: "0.0.0.0"
